@@ -263,13 +263,7 @@ Reset
   import { getDatabase, ref, set, get, onValue, off } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-database.js';
 
   const firebaseConfig = {
-    apiKey: 'AIzaSyC3MkWviMR3r8iQGJaWWT4S12CgHJ1QbgE',
-    authDomain: 'icc-pay.firebaseapp.com',
-    databaseURL: 'https://icc-pay-default-rtdb.firebaseio.com',
-    projectId: 'icc-pay',
-    storageBucket: 'icc-pay.firebasestorage.app',
-    messagingSenderId: '229677855009',
-    appId: '1:229677855009:web:e396d6981d61077bb44e60'
+    databaseURL: 'https://icc-pay-default-rtdb.firebaseio.com'
   };
 
   const app = initializeApp(firebaseConfig);
@@ -306,7 +300,129 @@ Reset
   let isProcessing = false;
   let lastGeneratedLink = '';
   let lastGeneratedQr = '';
+  let currentTr = '';
   let openUpiTimeout = null;
+  let lastAppliedCallbackKey = '';
+
+  const STORAGE_KEYS = {
+    paymentId: 'icc_current_payment_id',
+    tr: 'icc_current_tr',
+    upiLink: 'icc_upi_link',
+    qrImage: 'icc_qr_image'
+  };
+
+  const safeStorage = {
+    get(key) {
+      try {
+        return window.localStorage.getItem(key);
+      } catch (error) {
+        return null;
+      }
+    },
+    set(key, value) {
+      try {
+        window.localStorage.setItem(key, value);
+      } catch (error) {
+        // Ignore storage failures so the app keeps working in restricted environments.
+      }
+    },
+    remove(key) {
+      try {
+        window.localStorage.removeItem(key);
+      } catch (error) {
+        // Ignore storage failures so the app keeps working in restricted environments.
+      }
+    }
+  };
+
+  const saveCurrentSession = () => {
+    if (!currentPaymentId) return;
+    safeStorage.set(STORAGE_KEYS.paymentId, currentPaymentId);
+    if (currentTr) {
+      safeStorage.set(STORAGE_KEYS.tr, currentTr);
+    }
+    if (lastGeneratedLink) {
+      safeStorage.set(STORAGE_KEYS.upiLink, lastGeneratedLink);
+    }
+    if (lastGeneratedQr) {
+      safeStorage.set(STORAGE_KEYS.qrImage, lastGeneratedQr);
+    }
+  };
+
+  const restoreCurrentSession = async () => {
+    const storedPaymentId = safeStorage.get(STORAGE_KEYS.paymentId);
+    const storedTr = safeStorage.get(STORAGE_KEYS.tr) || '';
+    const storedUpiLink = safeStorage.get(STORAGE_KEYS.upiLink) || '';
+    const storedQrImage = safeStorage.get(STORAGE_KEYS.qrImage) || '';
+
+    if (!storedPaymentId) {
+      if (currentPaymentId) {
+        saveCurrentSession();
+      }
+      return;
+    }
+
+    currentPaymentId = storedPaymentId;
+    currentTr = storedTr;
+    lastGeneratedLink = storedUpiLink;
+    lastGeneratedQr = storedQrImage;
+
+    if (!currentPaymentId) return;
+
+    const paymentRef = ref(db, `${databasePath}/${currentPaymentId}`);
+    try {
+      const snapshot = await get(paymentRef);
+      if (snapshot.exists()) {
+        const restoredPayment = snapshot.val();
+        if (restoredPayment?.tr) {
+          currentTr = restoredPayment.tr;
+        }
+        if (restoredPayment?.upiLink) {
+          lastGeneratedLink = restoredPayment.upiLink;
+        }
+        if (restoredPayment?.qrImage) {
+          lastGeneratedQr = restoredPayment.qrImage;
+        }
+        setActiveState(restoredPayment);
+      } else {
+        setActiveState({
+          amount: '',
+          tr: currentTr,
+          status: 'pending',
+          txnId: '',
+          approvalRef: '',
+          responseCode: '',
+          upiLink: lastGeneratedLink,
+          qrImage: lastGeneratedQr,
+          createdAt: '',
+          updatedAt: ''
+        });
+      }
+    } catch (error) {
+      setFormMessage(`Unable to restore payment session: ${error.message}`, 'error');
+    }
+
+    attachListener(currentPaymentId);
+    saveCurrentSession();
+  };
+
+  const clearCurrentSession = (resetUi = false) => {
+    safeStorage.remove(STORAGE_KEYS.paymentId);
+    safeStorage.remove(STORAGE_KEYS.tr);
+    safeStorage.remove(STORAGE_KEYS.upiLink);
+    safeStorage.remove(STORAGE_KEYS.qrImage);
+    detachListener();
+    currentPaymentId = null;
+    currentTr = '';
+    lastGeneratedLink = '';
+    lastGeneratedQr = '';
+    lastAppliedCallbackKey = '';
+    if (resetUi) {
+      setIdleState();
+      setFormMessage('', 'neutral');
+      amountInput.value = '';
+    }
+  };
 
   const formatCurrency = (value) => {
     const amount = Number(value || 0);
@@ -380,7 +496,7 @@ Reset
     detailStatus.className = 'bg-[#F1F5F9] text-outline-variant px-2 py-1 rounded-[6px] font-label-sm text-label-sm';
   };
 
-  const setActiveState = (payment) => {
+  const setActiveState = (payment = {}) => {
     paymentSections.classList.remove('opacity-40', 'grayscale', 'pointer-events-none');
     paymentSections.classList.add('opacity-100');
     qrImage.classList.remove('hidden');
@@ -391,7 +507,7 @@ Reset
     upiLinkText.classList.remove('text-outline-variant');
     upiLinkText.classList.add('text-on-surface');
     detailAmount.textContent = formatCurrency(payment.amount);
-    detailTr.textContent = payment.tr || '--';
+    detailTr.textContent = payment.tr || currentTr || '--';
     detailTxnId.textContent = payment.txnId || '--';
     detailApproval.textContent = payment.approvalRef || '--';
     detailResponseCode.textContent = payment.responseCode || '--';
@@ -419,7 +535,7 @@ Reset
       statusIcon.textContent = 'hourglass_top';
       statusIconWrapper.classList.add('status-pulse');
       statusTitle.textContent = 'Awaiting payment';
-      statusSubtitle.textContent = 'Open UPI app and complete the transfer';
+      statusSubtitle.textContent = 'Waiting for payment confirmation...';
     }
 
     openUpiButton.classList.remove('hidden');
@@ -529,9 +645,12 @@ Reset
       };
 
       currentPaymentId = await writePaymentRecord(payload);
+      currentTr = tr;
       lastGeneratedLink = upiLink;
       lastGeneratedQr = qrUrl;
+      setActiveState(payload);
       attachListener(currentPaymentId);
+      saveCurrentSession();
       setFormMessage('Payment request created. Open the UPI app to complete the payment.', 'success');
     } catch (error) {
       isProcessing = false;
@@ -567,31 +686,75 @@ Reset
       }
     }, 2500);
 
-    window.location.href = lastGeneratedLink;
+    window.location.assign(lastGeneratedLink);
   };
 
   const resetSession = () => {
     if (openUpiTimeout) clearTimeout(openUpiTimeout);
-    detachListener();
-    currentPaymentId = null;
-    lastGeneratedLink = '';
-    lastGeneratedQr = '';
+    clearCurrentSession(true);
     isProcessing = false;
-    setIdleState();
-    setFormMessage('', 'neutral');
-    amountInput.value = '';
+  };
+
+  const normalizePaymentStatus = (rawStatus) => {
+    const normalized = String(rawStatus || '').trim().toUpperCase();
+    if (normalized === 'SUCCESS') return 'success';
+    if (normalized === 'FAILURE') return 'failed';
+    if (normalized === 'SUBMITTED' || normalized === 'PENDING' || normalized === 'UNKNOWN') return 'pending';
+    return 'pending';
+  };
+
+  const readResponseParams = () => {
+    const fullUrl = window.location.href;
+    const parsedUrl = new URL(fullUrl);
+    const params = new URLSearchParams(parsedUrl.search);
+
+    const hashPart = parsedUrl.hash.startsWith('#') ? parsedUrl.hash.slice(1) : parsedUrl.hash;
+    const hashQuery = hashPart.includes('?') ? hashPart.slice(hashPart.indexOf('?') + 1) : hashPart;
+    const hashParams = new URLSearchParams(hashQuery);
+
+    const allParams = new URLSearchParams();
+    for (const [key, value] of params.entries()) allParams.set(key, value);
+    for (const [key, value] of hashParams.entries()) {
+      if (!allParams.has(key)) allParams.set(key, value);
+    }
+
+    return {
+      fullUrl,
+      status: allParams.get('status') || allParams.get('Status') || '',
+      txnId: allParams.get('txnId') || allParams.get('txnID') || allParams.get('txnid') || '',
+      approvalRefNo: allParams.get('approvalRefNo') || allParams.get('approvalRef') || allParams.get('ApprovalRefNo') || '',
+      responseCode: allParams.get('responseCode') || allParams.get('respCode') || allParams.get('responsecode') || '',
+      txnRef: allParams.get('txnRef') || allParams.get('tr') || '',
+      tr: allParams.get('tr') || allParams.get('txnRef') || ''
+    };
+  };
+
+  const cleanUrlAfterProcessing = () => {
+    const cleanUrl = `${window.location.pathname}${window.location.hash}`;
+    window.history.replaceState({}, document.title, cleanUrl || '/');
   };
 
   const applyIntentResponse = async (params) => {
     if (!currentPaymentId) return;
-    const status = String(params.status || '').toUpperCase();
-    const normalizedStatus = status === 'SUCCESS' ? 'success' : status === 'FAILURE' ? 'failed' : 'pending';
-    if (!status && !params.txnId && !params.approvalRefNo && !params.responseCode) return;
 
-    if (normalizedStatus === 'pending' && !status) return;
+    const callbackStatus = normalizePaymentStatus(params.status);
+    const hasMeaningfulCallback = Boolean(
+      params.status || params.txnId || params.approvalRefNo || params.responseCode || params.txnRef || params.tr
+    );
+
+    if (!hasMeaningfulCallback) {
+      cleanUrlAfterProcessing();
+      return;
+    }
+
+    const callbackKey = `${currentPaymentId}|${callbackStatus}|${params.txnId || ''}|${params.approvalRefNo || ''}|${params.responseCode || ''}`;
+    if (lastAppliedCallbackKey === callbackKey) {
+      cleanUrlAfterProcessing();
+      return;
+    }
 
     const updatePayload = {
-      status: normalizedStatus,
+      status: callbackStatus,
       txnId: params.txnId || '',
       approvalRef: params.approvalRefNo || '',
       responseCode: params.responseCode || '',
@@ -603,23 +766,40 @@ Reset
       const existingSnapshot = await get(snapshotRef);
       const existingRecord = existingSnapshot.exists() ? existingSnapshot.val() : {};
       await set(snapshotRef, { ...existingRecord, ...updatePayload });
-      setFormMessage('UPI response captured and payment status updated.', 'success');
+      lastAppliedCallbackKey = callbackKey;
+      setFormMessage(
+        callbackStatus === 'success'
+          ? 'Payment completed successfully.'
+          : callbackStatus === 'failed'
+            ? 'The UPI app reported a failure.'
+            : 'Waiting for payment confirmation...',
+        callbackStatus === 'success' ? 'success' : callbackStatus === 'failed' ? 'error' : 'neutral'
+      );
+
+      if (callbackStatus === 'success' || callbackStatus === 'failed') {
+        safeStorage.remove(STORAGE_KEYS.paymentId);
+        safeStorage.remove(STORAGE_KEYS.tr);
+        safeStorage.remove(STORAGE_KEYS.upiLink);
+        safeStorage.remove(STORAGE_KEYS.qrImage);
+      }
     } catch (error) {
       setFormMessage(`Unable to update payment status: ${error.message}`, 'error');
+    } finally {
+      cleanUrlAfterProcessing();
     }
   };
 
-  const readIntentResponseFromUrl = () => {
-    const params = new URLSearchParams(window.location.search);
-    const response = {
-      status: params.get('status') || params.get('Status') || '',
-      txnId: params.get('txnId') || params.get('txnID') || params.get('txnid') || '',
-      approvalRefNo: params.get('approvalRefNo') || params.get('approvalRef') || params.get('approvalref') || '',
-      responseCode: params.get('responseCode') || params.get('responsecode') || ''
-    };
-    if (response.status || response.txnId || response.approvalRefNo || response.responseCode) {
-      applyIntentResponse(response);
+  const handleReturnFlow = () => {
+    if (!currentPaymentId) return;
+
+    const response = readResponseParams();
+    if (!response.status && !response.txnId && !response.approvalRefNo && !response.responseCode && !response.txnRef && !response.tr) {
+      setFormMessage('Waiting for payment confirmation...', 'neutral');
+      cleanUrlAfterProcessing();
+      return;
     }
+
+    applyIntentResponse(response);
   };
 
   generateButton.addEventListener('click', handleGenerate);
@@ -632,16 +812,29 @@ Reset
       handleGenerate();
     }
   });
+
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
-      readIntentResponseFromUrl();
+      handleReturnFlow();
     }
   });
-  window.addEventListener('focus', readIntentResponseFromUrl);
+  document.addEventListener('DOMContentLoaded', () => {
+    restoreCurrentSession();
+  });
+  window.addEventListener('pageshow', () => {
+    restoreCurrentSession();
+    handleReturnFlow();
+  });
+  window.addEventListener('focus', () => {
+    restoreCurrentSession();
+    handleReturnFlow();
+  });
+  window.addEventListener('popstate', handleReturnFlow);
   window.addEventListener('online', () => setFormMessage('Connection restored. You can continue.', 'success'));
   window.addEventListener('offline', () => setFormMessage('Internet unavailable. Please check your connection.', 'error'));
 
   setIdleState();
-  readIntentResponseFromUrl();
+  restoreCurrentSession();
+  handleReturnFlow();
 </script>
 </body></html>
